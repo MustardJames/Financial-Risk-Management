@@ -1,0 +1,4 @@
+instrument_type,symbol,quantity,underlying,option_type,strike,maturity,volatility,rate
+stock,AAPL,100,,,,,,0.0
+option,AAPL_C_210,10,AAPL,call,210,0.5,0.25,0.04
+stock,MSFT,-50,,,,,,0.0
