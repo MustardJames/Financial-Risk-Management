@@ -1,0 +1,13 @@
+test_id,test_name,category,result,evidence,notes
+2.1,Portfolio Ingestion,Input and Data Parsing,Pass,"Loaded 10 positions with risk symbols ['AAPL', 'JPM', 'MSFT', 'NVDA', 'XOM']",System successfully parsed mixed portfolio of stocks and options.
+2.2,Historical Data Alignment,Input and Data Parsing,Pass,"Price history shape: (2515, 11)","Price data cleaned, aligned, and converted into return series."
+3.1,Covariance Matrix PSD Check,Risk Identification and Calibration,Pass,"Symmetric=True, PSD=True, min_eigenvalue=8.058070699744783e-05",Covariance matrix validated before parametric and Monte Carlo risk calculations.
+3.2,Distributional Assumption Test,Risk Identification and Calibration,Pass,Jarque-Bera test completed for all underlying return series.,Normality test documents limitations of the Parametric VaR model.
+3.3,Option Volatility Calibration,Risk Identification and Calibration,Pass,All option positions priced using implied_vol input.,System uses implied volatility rather than historical volatility for option pricing.
+4.1,Parametric VaR Execution,Risk Measurement,Pass,"Parametric VaR=6048.56, ES=6949.13",Delta-normal VaR and ES calculated successfully.
+4.2,Historical VaR and ES Execution,Risk Measurement,Pass,"Historical VaR=5159.53, ES=8441.23",Historical simulation VaR and ES calculated from empirical loss distribution.
+4.3,Monte Carlo Convergence,Risk Measurement,Pass,VaR change decreased from 2.39% to 0.52% as simulations increased.,Monte Carlo VaR stabilizes as simulation paths increase.
+5.1,Backtesting Exception Tracking,Model Backtesting,Pass,"Rolling 252-day VaR exceptions tracked for Historical, Parametric, and Monte Carlo methods.",System correctly flags realized losses exceeding predicted VaR.
+5.2,Kupiec Unconditional Coverage Test,Model Backtesting,Partial Pass,Historical VaR passed; Parametric and Monte Carlo VaR failed at 5% significance level.,Failures indicate model risk from normality assumptions and simplified volatility dynamics.
+6.2,Hypothetical Stress Scenario,Scenario Analysis and Stress Testing,Pass,Stress scenario suite identified maximum loss under moderate selloff + volatility crush.,System performs full revaluation under deterministic equity and volatility shocks.
+7.1,Greeks-Based Benchmarking,Model Risk Management,Pass,MC VaR exceeds Parametric VaR by 29.51%.,Material divergence confirms nonlinear option risk and limitations of delta-only approximation.

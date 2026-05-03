@@ -106,9 +106,9 @@ class Position:
     option_type: Optional[Literal["call", "put"]] = None
     strike: Optional[float] = None
     maturity: Optional[float] = None   # years to maturity
-    volatility: Optional[float] = None # annualized implied / input volatility
-    rate: float = 0.0                  # continuously compounded annual rate
-
+    volatility: Optional[float] = None  # annualized implied / input volatility
+    rate: float = 0.0  # continuously compounded annual rate
+    contract_multiplier: float = 1.0  # 1 for stocks, usually 100 for equity options
     @property
     def risk_symbol(self) -> str:
         return self.symbol if self.instrument_type == "stock" else str(self.underlying)
@@ -197,6 +197,7 @@ class RiskCalculationSystem:
         "instrument_type",
         "symbol",
         "quantity",
+        "underlying",
     }
 
     def __init__(
@@ -251,6 +252,23 @@ class RiskCalculationSystem:
         )
 
     def _coerce_portfolio(self, portfolio: pd.DataFrame) -> List[Position]:
+        """
+        Parse portfolio.csv into Position objects.
+
+        Supports the new portfolio format:
+        - instrument_id
+        - instrument_type
+        - symbol
+        - underlying
+        - quantity
+        - option_type
+        - strike
+        - maturity
+        - implied_vol
+        - risk_free_rate
+        - contract_multiplier
+        """
+
         cols = {c.lower() for c in portfolio.columns}
         missing = self.REQUIRED_COLUMNS - cols
         if missing:
@@ -258,33 +276,127 @@ class RiskCalculationSystem:
 
         df = portfolio.copy()
         df.columns = [c.lower() for c in df.columns]
+
         out: List[Position] = []
+
+        today = pd.Timestamp.today().normalize()
+
         for _, row in df.iterrows():
             instrument_type = str(row["instrument_type"]).strip().lower()
+
             if instrument_type not in {"stock", "option"}:
                 raise ValueError(f"Unsupported instrument_type: {instrument_type}")
-            out.append(
-                Position(
-                    instrument_type=instrument_type,  # type: ignore[arg-type]
-                    symbol=str(row["symbol"]),
-                    quantity=float(row["quantity"]),
-                    underlying=None if pd.isna(row.get("underlying")) else str(row.get("underlying")),
-                    option_type=None if pd.isna(row.get("option_type")) else str(row.get("option_type")).lower(),
-                    strike=None if pd.isna(row.get("strike")) else float(row.get("strike")),
-                    maturity=None if pd.isna(row.get("maturity")) else float(row.get("maturity")),
-                    volatility=None if pd.isna(row.get("volatility")) else float(row.get("volatility")),
-                    rate=0.0 if pd.isna(row.get("rate")) else float(row.get("rate")),
+
+            symbol = str(row["symbol"]).strip()
+            quantity = float(row["quantity"])
+
+            if instrument_type == "stock":
+                out.append(
+                    Position(
+                        instrument_type="stock",
+                        symbol=symbol,
+                        quantity=quantity,
+                        underlying=symbol,
+                        option_type=None,
+                        strike=None,
+                        maturity=None,
+                        volatility=None,
+                        rate=0.0,
+                        contract_multiplier=1.0,
+                    )
                 )
-            )
+
+            else:
+                underlying = str(row["underlying"]).strip()
+
+                option_type = str(row["option_type"]).strip().lower()
+                if option_type not in {"call", "put"}:
+                    raise ValueError(
+                        f"Option {symbol} has invalid option_type: {option_type}"
+                    )
+
+                strike = float(row["strike"])
+
+                # Convert maturity date into years to maturity
+                maturity_raw = row["maturity"]
+                maturity_date = pd.to_datetime(maturity_raw, errors="coerce")
+
+                if pd.isna(maturity_date):
+                    raise ValueError(f"Option {symbol} has invalid maturity: {maturity_raw}")
+
+                maturity_years = max((maturity_date - today).days / self.trading_days, 0.0)
+
+                # New portfolio uses implied_vol, but old code used volatility
+                if "implied_vol" in df.columns and not pd.isna(row.get("implied_vol")):
+                    volatility = float(row.get("implied_vol"))
+                elif "volatility" in df.columns and not pd.isna(row.get("volatility")):
+                    volatility = float(row.get("volatility"))
+                else:
+                    raise ValueError(f"Option {symbol} is missing implied_vol or volatility.")
+
+                # New portfolio uses risk_free_rate, but old code used rate
+                if "risk_free_rate" in df.columns and not pd.isna(row.get("risk_free_rate")):
+                    rate = float(row.get("risk_free_rate"))
+                elif "rate" in df.columns and not pd.isna(row.get("rate")):
+                    rate = float(row.get("rate"))
+                else:
+                    rate = 0.0
+
+                if "contract_multiplier" in df.columns and not pd.isna(row.get("contract_multiplier")):
+                    contract_multiplier = float(row.get("contract_multiplier"))
+                else:
+                    contract_multiplier = 100.0
+
+                out.append(
+                    Position(
+                        instrument_type="option",
+                        symbol=symbol,
+                        quantity=quantity,
+                        underlying=underlying,
+                        option_type=option_type,  # type: ignore[arg-type]
+                        strike=strike,
+                        maturity=maturity_years,
+                        volatility=volatility,
+                        rate=rate,
+                        contract_multiplier=contract_multiplier,
+                    )
+                )
+
         return out
 
     def _coerce_price_history(self, price_history: pd.DataFrame) -> pd.DataFrame:
+        """
+        Clean and align historical price data.
+        Handles missing values using forward-fill.
+        """
+
         if not isinstance(price_history.index, pd.DatetimeIndex):
             raise ValueError("price_history must have a DatetimeIndex.")
+
         prices = price_history.sort_index().copy()
-        prices = prices.astype(float)
+
+        prices = prices.apply(pd.to_numeric, errors="coerce")
+
+        missing_before = int(prices.isna().sum().sum())
+
+        # Forward-fill missing prices
+        prices = prices.ffill()
+
+        # Drop rows that are still missing at the beginning
+        prices = prices.dropna()
+
+        missing_after = int(prices.isna().sum().sum())
+
+        if missing_before > 0:
+            print(f"Warning: detected {missing_before} missing price values.")
+            print(f"After forward-fill, remaining missing values: {missing_after}")
+
+        if prices.empty:
+            raise ValueError("Price history is empty after cleaning.")
+
         if (prices <= 0).any().any():
             raise ValueError("All prices must be strictly positive for log-return calibration.")
+
         return prices
 
     # ------------------------------------------------------------------
@@ -309,6 +421,427 @@ class RiskCalculationSystem:
             "corr": corr,
         }
 
+    def covariance_psd_check(
+            self,
+            lookback: Optional[int] = None,
+            use_log_returns: bool = True,
+            tol: float = 1e-10,
+    ) -> Dict[str, object]:
+        """
+        Test 3.1: Check whether the covariance matrix is symmetric
+        and positive semi-definite.
+
+        A valid covariance matrix should be symmetric and have
+        non-negative eigenvalues.
+        """
+
+        data = self.log_returns if use_log_returns else self.simple_returns
+
+        if lookback is not None:
+            data = data.tail(lookback)
+
+        cov = data.cov()
+        cov_matrix = cov.to_numpy()
+
+        is_symmetric = bool(np.allclose(cov_matrix, cov_matrix.T, atol=tol))
+
+        eigenvalues = np.linalg.eigvalsh(cov_matrix)
+
+        min_eigenvalue = float(np.min(eigenvalues))
+        max_eigenvalue = float(np.max(eigenvalues))
+
+        is_psd = bool(is_symmetric and min_eigenvalue >= -tol)
+
+        if abs(min_eigenvalue) < tol:
+            adjusted_min_eigenvalue = 0.0
+        else:
+            adjusted_min_eigenvalue = min_eigenvalue
+
+        condition_number = (
+            float(max_eigenvalue / adjusted_min_eigenvalue)
+            if adjusted_min_eigenvalue > 0
+            else np.inf
+        )
+
+        return {
+            "num_assets": int(cov.shape[0]),
+            "is_symmetric": is_symmetric,
+            "is_psd": is_psd,
+            "min_eigenvalue": min_eigenvalue,
+            "max_eigenvalue": max_eigenvalue,
+            "condition_number": condition_number,
+            "covariance_matrix": cov,
+            "eigenvalues": eigenvalues,
+        }
+
+    def distribution_test(
+            self,
+            lookback: Optional[int] = None,
+            use_log_returns: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Test 3.2: Jarque-Bera normality test for each asset's returns.
+
+        The Jarque-Bera test checks whether skewness and kurtosis
+        are consistent with a normal distribution.
+
+        For chi-square distribution with 2 degrees of freedom:
+        p-value = exp(-JB / 2)
+        """
+
+        data = self.log_returns if use_log_returns else self.simple_returns
+
+        if lookback is not None:
+            data = data.tail(lookback)
+
+        records = []
+
+        for symbol in data.columns:
+            x = data[symbol].dropna()
+            n = len(x)
+
+            if n < 8:
+                records.append(
+                    {
+                        "symbol": symbol,
+                        "n": n,
+                        "skewness": np.nan,
+                        "kurtosis": np.nan,
+                        "jarque_bera": np.nan,
+                        "p_value": np.nan,
+                        "reject_normality_5pct": None,
+                    }
+                )
+                continue
+
+            mean = float(x.mean())
+            std = float(x.std(ddof=0))
+
+            if std == 0:
+                records.append(
+                    {
+                        "symbol": symbol,
+                        "n": n,
+                        "skewness": np.nan,
+                        "kurtosis": np.nan,
+                        "jarque_bera": np.nan,
+                        "p_value": np.nan,
+                        "reject_normality_5pct": None,
+                    }
+                )
+                continue
+
+            z = (x - mean) / std
+
+            skewness = float(np.mean(z ** 3))
+            kurtosis = float(np.mean(z ** 4))
+
+            jb_stat = float((n / 6.0) * (skewness ** 2 + ((kurtosis - 3.0) ** 2) / 4.0))
+
+            # Chi-square survival function with 2 degrees of freedom
+            p_value = float(np.exp(-jb_stat / 2.0))
+
+            records.append(
+                {
+                    "symbol": symbol,
+                    "n": int(n),
+                    "skewness": skewness,
+                    "kurtosis": kurtosis,
+                    "jarque_bera": jb_stat,
+                    "p_value": p_value,
+                    "reject_normality_5pct": bool(p_value < 0.05),
+                }
+            )
+
+        return pd.DataFrame(records)
+
+    def option_volatility_calibration_check(
+            self,
+            lookback: Optional[int] = 252,
+    ) -> pd.DataFrame:
+        """
+        Test 3.3: Check whether option valuation uses implied volatility
+        rather than historical volatility.
+
+        For each option position, compare:
+        - implied volatility from portfolio input
+        - historical annualized volatility from underlying returns
+        - option price using implied volatility
+        - option price using historical volatility
+        """
+
+        hist_vol = self.calibrate_from_history(
+            lookback=lookback,
+            use_log_returns=True
+        )["vol_annual"]
+
+        records = []
+
+        for pos in self.portfolio:
+            if pos.instrument_type != "option":
+                continue
+
+            if pos.underlying is None:
+                raise ValueError(f"Option {pos.symbol} is missing underlying.")
+
+            if pos.option_type not in {"call", "put"}:
+                raise ValueError(f"Option {pos.symbol} has invalid option_type.")
+
+            if pos.strike is None or pos.maturity is None:
+                raise ValueError(f"Option {pos.symbol} is missing strike or maturity.")
+
+            if pos.volatility is None:
+                raise ValueError(
+                    f"Option {pos.symbol} is missing implied volatility. "
+                    "Test 3.3 requires implied volatility input."
+                )
+
+            spot = self.current_spots[pos.underlying]
+            implied_vol = float(pos.volatility)
+            historical_vol = float(hist_vol[pos.underlying])
+
+            price_using_implied_vol = self.pricer.price(
+                spot=spot,
+                strike=pos.strike,
+                maturity=max(pos.maturity, 0.0),
+                rate=pos.rate,
+                volatility=implied_vol,
+                option_type=pos.option_type,
+            )
+
+            price_using_historical_vol = self.pricer.price(
+                spot=spot,
+                strike=pos.strike,
+                maturity=max(pos.maturity, 0.0),
+                rate=pos.rate,
+                volatility=historical_vol,
+                option_type=pos.option_type,
+            )
+
+            position_value_using_implied_vol = (
+                    pos.quantity
+                    * pos.contract_multiplier
+                    * price_using_implied_vol
+            )
+
+            position_value_using_historical_vol = (
+                    pos.quantity
+                    * pos.contract_multiplier
+                    * price_using_historical_vol
+            )
+
+            records.append(
+                {
+                    "option_symbol": pos.symbol,
+                    "underlying": pos.underlying,
+                    "option_type": pos.option_type,
+                    "strike": pos.strike,
+                    "maturity_years": pos.maturity,
+                    "spot": spot,
+                    "implied_vol_used": implied_vol,
+                    "historical_vol_reference": historical_vol,
+                    "option_price_using_implied_vol": price_using_implied_vol,
+                    "option_price_using_historical_vol": price_using_historical_vol,
+                    "position_value_using_implied_vol": position_value_using_implied_vol,
+                    "position_value_using_historical_vol": position_value_using_historical_vol,
+                    "pricing_vol_source": "implied_vol",
+                }
+            )
+
+        if not records:
+            raise ValueError("No option positions found in portfolio.")
+
+        return pd.DataFrame(records)
+
+    def stress_test(
+            self,
+            equity_shock: float = -0.20,
+            implied_vol_shock: float = 0.50,
+    ) -> Dict[str, object]:
+        """
+        Test 6.2: Hypothetical stress scenario.
+
+        Apply:
+        - deterministic equity price shock, e.g. -20%
+        - deterministic implied volatility shock, e.g. +50%
+
+        Then fully revalue the portfolio and report stress loss.
+        """
+
+        current_value = self.portfolio_value()
+
+        shocked_spots = {
+            symbol: spot * (1.0 + equity_shock)
+            for symbol, spot in self.current_spots.items()
+        }
+
+        records = []
+        stressed_value = 0.0
+
+        for pos in self.portfolio:
+            base_value = self.position_value(pos, self.current_spots)
+
+            if pos.instrument_type == "stock":
+                stressed_position_value = pos.quantity * shocked_spots[pos.symbol]
+
+                records.append(
+                    {
+                        "symbol": pos.symbol,
+                        "instrument_type": pos.instrument_type,
+                        "base_value": base_value,
+                        "stressed_value": stressed_position_value,
+                        "stress_pnl": stressed_position_value - base_value,
+                        "stress_loss": base_value - stressed_position_value,
+                        "equity_shock": equity_shock,
+                        "implied_vol_shock": 0.0,
+                    }
+                )
+
+            else:
+                if pos.underlying is None:
+                    raise ValueError(f"Option {pos.symbol} is missing underlying.")
+                if pos.option_type not in {"call", "put"}:
+                    raise ValueError(f"Option {pos.symbol} has invalid option_type.")
+                if pos.strike is None or pos.maturity is None:
+                    raise ValueError(f"Option {pos.symbol} is missing strike or maturity.")
+
+                if pos.volatility is None:
+                    hist_vol = self.calibrate_from_history()["vol_annual"]
+                    base_vol = float(hist_vol[pos.underlying])
+                else:
+                    base_vol = float(pos.volatility)
+
+                shocked_vol = base_vol * (1.0 + implied_vol_shock)
+
+                shocked_option_price = self.pricer.price(
+                    spot=shocked_spots[pos.underlying],
+                    strike=pos.strike,
+                    maturity=max(pos.maturity, 0.0),
+                    rate=pos.rate,
+                    volatility=shocked_vol,
+                    option_type=pos.option_type,
+                )
+
+                contract_multiplier = getattr(pos, "contract_multiplier", 100.0)
+
+                stressed_position_value = (
+                        pos.quantity
+                        * contract_multiplier
+                        * shocked_option_price
+                )
+
+                records.append(
+                    {
+                        "symbol": pos.symbol,
+                        "instrument_type": pos.instrument_type,
+                        "underlying": pos.underlying,
+                        "option_type": pos.option_type,
+                        "strike": pos.strike,
+                        "base_vol": base_vol,
+                        "shocked_vol": shocked_vol,
+                        "base_value": base_value,
+                        "stressed_value": stressed_position_value,
+                        "stress_pnl": stressed_position_value - base_value,
+                        "stress_loss": base_value - stressed_position_value,
+                        "equity_shock": equity_shock,
+                        "implied_vol_shock": implied_vol_shock,
+                    }
+                )
+
+            stressed_value += stressed_position_value
+
+        stress_loss = current_value - stressed_value
+        stress_pnl = stressed_value - current_value
+
+        details = pd.DataFrame(records)
+
+        return {
+            "equity_shock": equity_shock,
+            "implied_vol_shock": implied_vol_shock,
+            "current_value": current_value,
+            "stressed_value": float(stressed_value),
+            "stress_pnl": float(stress_pnl),
+            "stress_loss": float(stress_loss),
+            "stress_loss_pct": float(stress_loss / current_value),
+            "details": details,
+        }
+
+    def stress_scenario_suite(
+            self,
+            scenarios: Optional[List[Dict[str, float]]] = None,
+    ) -> pd.DataFrame:
+        """
+        Run multiple hypothetical stress scenarios and summarize portfolio-level impact.
+
+        This extends Test 6.2 by identifying which market scenario creates
+        the largest portfolio loss.
+        """
+
+        if scenarios is None:
+            scenarios = [
+                {
+                    "scenario": "Equity selloff + volatility spike",
+                    "equity_shock": -0.20,
+                    "implied_vol_shock": 0.50,
+                },
+                {
+                    "scenario": "Equity selloff only",
+                    "equity_shock": -0.20,
+                    "implied_vol_shock": 0.00,
+                },
+                {
+                    "scenario": "Moderate selloff + volatility crush",
+                    "equity_shock": -0.10,
+                    "implied_vol_shock": -0.30,
+                },
+                {
+                    "scenario": "Volatility crush only",
+                    "equity_shock": 0.00,
+                    "implied_vol_shock": -0.50,
+                },
+                {
+                    "scenario": "Equity rally + volatility crush",
+                    "equity_shock": 0.20,
+                    "implied_vol_shock": -0.30,
+                },
+                {
+                    "scenario": "Equity rally + volatility spike",
+                    "equity_shock": 0.20,
+                    "implied_vol_shock": 0.50,
+                },
+            ]
+
+        records = []
+
+        for sc in scenarios:
+            res = self.stress_test(
+                equity_shock=sc["equity_shock"],
+                implied_vol_shock=sc["implied_vol_shock"],
+            )
+
+            records.append(
+                {
+                    "scenario": sc["scenario"],
+                    "equity_shock": sc["equity_shock"],
+                    "implied_vol_shock": sc["implied_vol_shock"],
+                    "current_value": res["current_value"],
+                    "stressed_value": res["stressed_value"],
+                    "stress_pnl": res["stress_pnl"],
+                    "stress_loss": res["stress_loss"],
+                    "stress_loss_pct": res["stress_loss_pct"],
+                }
+            )
+
+        result = pd.DataFrame(records)
+
+        # Largest loss first
+        result = result.sort_values(
+            by="stress_loss",
+            ascending=False
+        ).reset_index(drop=True)
+
+        return result
+
     # ------------------------------------------------------------------
     # Valuation helpers
     # ------------------------------------------------------------------
@@ -329,6 +862,7 @@ class RiskCalculationSystem:
             sigma = float(hist_vol[position.underlying])
 
         spot = spots[position.underlying]
+
         price = self.pricer.price(
             spot=spot,
             strike=position.strike,
@@ -337,7 +871,8 @@ class RiskCalculationSystem:
             volatility=sigma,
             option_type=position.option_type,  # type: ignore[arg-type]
         )
-        return position.quantity * price
+
+        return position.quantity * position.contract_multiplier * price
 
     def portfolio_value(self, spots: Optional[Dict[str, float]] = None) -> float:
         use_spots = self.current_spots if spots is None else spots
@@ -376,7 +911,8 @@ class RiskCalculationSystem:
                     )
                     for s in scenario_spots[:, idx]
                 ])
-                values += pos.quantity * option_values
+
+                values += pos.quantity * pos.contract_multiplier * option_values
         return values
 
     def _losses_from_values(self, future_values: np.ndarray, current_value: Optional[float] = None) -> np.ndarray:
@@ -454,7 +990,8 @@ class RiskCalculationSystem:
                     volatility=sigma,
                     option_type=pos.option_type,
                 )
-                exposures[pos.underlying] += pos.quantity * delta
+
+                exposures[pos.underlying] += pos.quantity * pos.contract_multiplier * delta
         return exposures
 
     def parametric_var_es(
@@ -540,6 +1077,130 @@ class RiskCalculationSystem:
             "var": self._var_from_losses(losses, p),
             "es": self._es_from_losses(losses, p),
             "num_scenarios": int(n_sims),
+        }
+
+    def monte_carlo_convergence_test(
+            self,
+            confidence: Optional[float] = None,
+            lookback: Optional[int] = 252,
+            horizon_days: int = 1,
+            n_sims_list: Optional[List[int]] = None,
+            seed: int = 42,
+    ) -> pd.DataFrame:
+        """
+        Test 4.3: Monte Carlo convergence test.
+
+        Run Monte Carlo VaR / ES using increasing numbers of simulation paths.
+        The VaR and ES estimates should become more stable as n_sims increases.
+        """
+
+        if n_sims_list is None:
+            n_sims_list = [1000, 10000, 100000]
+
+        records = []
+
+        previous_var = None
+
+        for n_sims in n_sims_list:
+            res = self.monte_carlo_var_es(
+                confidence=confidence,
+                lookback=lookback,
+                horizon_days=horizon_days,
+                n_sims=n_sims,
+                seed=seed,
+            )
+
+            var = float(res["var"])
+            es = float(res["es"])
+
+            if previous_var is None:
+                var_change = np.nan
+                var_change_pct = np.nan
+            else:
+                var_change = var - previous_var
+                var_change_pct = var_change / previous_var
+
+            records.append(
+                {
+                    "n_sims": n_sims,
+                    "current_value": res["current_value"],
+                    "var": var,
+                    "es": es,
+                    "var_change_from_previous": var_change,
+                    "var_change_pct_from_previous": var_change_pct,
+                }
+            )
+
+            previous_var = var
+
+        return pd.DataFrame(records)
+
+    def greeks_based_benchmark(
+            self,
+            confidence: Optional[float] = None,
+            lookback: Optional[int] = 252,
+            horizon_days: int = 1,
+            n_sims: int = 10000,
+            seed: int = 42,
+            tolerance_pct: float = 0.20,
+    ) -> Dict[str, object]:
+        """
+        Test 7.1: Greeks-based benchmarking.
+
+        Compare:
+        - First-order Delta-Normal Parametric VaR
+        - Full-revaluation Monte Carlo VaR
+
+        For portfolios with options, a large difference indicates nonlinear
+        option risk that cannot be fully captured by delta-only approximation.
+        """
+
+        param_res = self.parametric_var_es(
+            confidence=confidence,
+            lookback=lookback,
+            horizon_days=horizon_days,
+        )
+
+        mc_res = self.monte_carlo_var_es(
+            confidence=confidence,
+            lookback=lookback,
+            horizon_days=horizon_days,
+            n_sims=n_sims,
+            seed=seed,
+        )
+
+        param_var = float(param_res["var"])
+        mc_var = float(mc_res["var"])
+
+        difference = mc_var - param_var
+        difference_pct = difference / param_var if param_var != 0 else np.nan
+
+        within_tolerance = bool(abs(difference_pct) <= tolerance_pct)
+
+        if within_tolerance:
+            interpretation = (
+                "Monte Carlo VaR and Delta-Normal VaR are within the tolerance range. "
+                "The portfolio behaves approximately linearly over the tested horizon."
+            )
+        else:
+            interpretation = (
+                "Monte Carlo VaR and Delta-Normal VaR differ materially. "
+                "This indicates nonlinear option risk and shows the limitation of "
+                "a first-order delta approximation."
+            )
+
+        return {
+            "confidence": self.default_confidence if confidence is None else confidence,
+            "lookback": lookback,
+            "horizon_days": horizon_days,
+            "n_sims": n_sims,
+            "parametric_var": param_var,
+            "monte_carlo_var": mc_var,
+            "difference": difference,
+            "difference_pct": difference_pct,
+            "tolerance_pct": tolerance_pct,
+            "within_tolerance": within_tolerance,
+            "interpretation": interpretation,
         }
 
     # ------------------------------------------------------------------
